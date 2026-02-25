@@ -1,0 +1,28 @@
+-- Add orders
+
+curl -X POST http://127.0.0.1:8000/orders \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: test-123" \
+  -d '{"customer_id":"cust1","item_id":"item1","quantity":1}'
+
+-- Same Key, Different Payload (Conflict Case)
+curl -X POST http://127.0.0.1:8000/orders \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: test-123" \
+  -d '{"customer_id":"cust1","item_id":"item1","quantity":5}'
+
+-- Simulated Failure After Commit
+curl -X POST http://127.0.0.1:8000/orders \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: test-fail-1" \
+  -H "X-Debug-Fail-After-Commit: true" \
+  -d '{"customer_id":"cust2","item_id":"item2","quantity":1}'
+
+-- Retry After Simulated Failure
+curl -X POST http://127.0.0.1:8000/orders \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: test-fail-1" \
+  -d '{"customer_id":"cust2","item_id":"item2","quantity":1}'
+
+ -- Verify Order Exists
+curl http://127.0.0.1:8000/orders/<order_id>
