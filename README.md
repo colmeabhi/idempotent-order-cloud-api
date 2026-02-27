@@ -20,7 +20,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install fastapi uvicorn
+pip3 install fastapi uvicorn
 ```
 
 ## Running the Server
