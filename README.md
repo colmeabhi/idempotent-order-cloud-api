@@ -9,7 +9,7 @@ Retry-safe order API with application-level idempotency for exactly-once semanti
 | EC2 Instance | `t2.nano` (`i-07e0f5eaca7e8ab55`) |
 | Region | `us-west-2a` |
 | OS | Ubuntu 24 (Linux) |
-| Public IP | `<YOUR_EC2_PUBLIC_IP>` |
+| Public IP | `54.187.0.144` |
 | App Port | `8000` |
 | Database | SQLite (`orders.db` on instance) |
 
@@ -28,7 +28,7 @@ Retry-safe order API with application-level idempotency for exactly-once semanti
 
 ```bash
 # SSH into instance
-ssh -i <your-key.pem> ubuntu@<YOUR_EC2_PUBLIC_IP>
+ssh -i <your-key.pem> ubuntu@54.187.0.144
 
 # Clone repo
 git clone <repo-url>
@@ -44,7 +44,7 @@ pip install "fastapi[standard]"
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Base URL: `http://<YOUR_EC2_PUBLIC_IP>:8000`
+Base URL: `http://54.187.0.144:8000`
 
 ## API Endpoints
 
@@ -58,7 +58,7 @@ Retrieves an order by ID.
 
 **Step 1 — Create an order:**
 ```bash
-curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
+curl -X POST http://54.187.0.144:8000/orders \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: test-123" \
   -d '{"customer_id":"cust1","item_id":"item1","quantity":1}'
@@ -66,7 +66,7 @@ curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
 
 **Step 2 — Retry with same key (idempotent replay):**
 ```bash
-curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
+curl -X POST http://54.187.0.144:8000/orders \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: test-123" \
   -d '{"customer_id":"cust1","item_id":"item1","quantity":1}'
@@ -74,7 +74,7 @@ curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
 
 **Step 3 — Same key, different payload (409 Conflict):**
 ```bash
-curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
+curl -X POST http://54.187.0.144:8000/orders \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: test-123" \
   -d '{"customer_id":"cust1","item_id":"item1","quantity":5}'
@@ -82,7 +82,7 @@ curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
 
 **Step 4 — Simulate failure after commit:**
 ```bash
-curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
+curl -X POST http://54.187.0.144:8000/orders \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: test-fail-1" \
   -H "X-Debug-Fail-After-Commit: true" \
@@ -91,7 +91,7 @@ curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
 
 **Step 5 — Retry after failure (returns stored response):**
 ```bash
-curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
+curl -X POST http://54.187.0.144:8000/orders \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: test-fail-1" \
   -d '{"customer_id":"cust2","item_id":"item2","quantity":1}'
@@ -99,5 +99,5 @@ curl -X POST http://<YOUR_EC2_PUBLIC_IP>:8000/orders \
 
 **Step 6 — Verify order exists:**
 ```bash
-curl http://<YOUR_EC2_PUBLIC_IP>:8000/orders/<order_id>
+curl http://54.187.0.144:8000/orders/<order_id>
 ```
