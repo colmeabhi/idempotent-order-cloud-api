@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 app = FastAPI()
 DB = "orders.db"
@@ -48,6 +48,47 @@ def init_db():
 
 
 init_db()
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Serverless Order API</title>
+  <style>
+    body { font-family: monospace; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #222; }
+    h1 { font-size: 1.4rem; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+    pre { background: #f4f4f4; padding: 12px; border-radius: 4px; overflow-x: auto; }
+    .method { font-weight: bold; }
+    .post { color: #2e7d32; }
+    .get  { color: #1565c0; }
+  </style>
+</head>
+<body>
+  <h1>Serverless Order API</h1>
+  <p>Running on <code>http://localhost:8000</code></p>
+
+  <h2>Endpoints</h2>
+
+  <p><span class="method post">POST</span> <code>/orders</code></p>
+  <p>Create a new order. Requires an <code>Idempotency-Key</code> header.</p>
+  <pre>curl -X POST http://localhost:8000/orders \\
+  -H "Content-Type: application/json" \\
+  -H "Idempotency-Key: &lt;unique-key&gt;" \\
+  -d '{"customer_id":"cust1","item_id":"item1","quantity":1}'</pre>
+
+  <p><span class="method get">GET</span> <code>/orders/{order_id}</code></p>
+  <p>Retrieve an order by its ID.</p>
+  <pre>curl http://localhost:8000/orders/&lt;order_id&gt;</pre>
+
+  <p>Interactive docs: <a href="/docs">/docs</a></p>
+</body>
+</html>
+"""
 
 
 @app.post("/orders", status_code=201)
