@@ -1,17 +1,23 @@
 import hashlib
 import json
 import logging
-import sqlite3
+import os
 import uuid
 from datetime import datetime, timezone
 
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 app = FastAPI()
-DB = "orders.db"
 
-# Structured JSON logging
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "orders")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("orders")
 
@@ -21,33 +27,25 @@ def log(level, req_id, msg, **kw):
                              "level": level, "req_id": req_id, "msg": msg, **kw}))
 
 
-# DB setup
 def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD
+    )
     return conn
 
 
-def init_db():
-    db = get_db()
-    db.executescript("""
-        CREATE TABLE IF NOT EXISTS orders (
-            order_id TEXT PRIMARY KEY, customer_id TEXT, item_id TEXT,
-            quantity INTEGER, status TEXT DEFAULT 'created'
-        );
-        CREATE TABLE IF NOT EXISTS ledger (
-            ledger_id TEXT PRIMARY KEY, order_id TEXT, customer_id TEXT, amount REAL
-        );
-        CREATE TABLE IF NOT EXISTS idempotency_records (
-            idem_key TEXT PRIMARY KEY, request_hash TEXT,
-            response_body TEXT, status_code INTEGER, created_at TEXT
-        );
-    """)
-    db.commit()
-    db.close()
-
-
-init_db()
+@app.get("/health")
+def health():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.close()
+        return {"status": "ok", "db": "connected"}
+    except Exception:
+        return JSONResponse({"status": "error", "db": "disconnected"}, status_code=503)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -57,39 +55,64 @@ async def index():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Serverless Order API</title>
+  <title>Order API</title>
   <style>
     body { font-family: monospace; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #222; }
     h1 { font-size: 1.4rem; }
     code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
     pre { background: #f4f4f4; padding: 12px; border-radius: 4px; overflow-x: auto; }
-    .method { font-weight: bold; }
-    .post { color: #2e7d32; }
-    .get  { color: #1565c0; }
   </style>
 </head>
 <body>
-  <h1>Serverless Order API</h1>
-  <p>Running on <code>http://localhost:8000</code></p>
-
-  <h2>Endpoints</h2>
-
-  <p><span class="method post">POST</span> <code>/orders</code></p>
-  <p>Create a new order. Requires an <code>Idempotency-Key</code> header.</p>
-  <pre>curl -X POST http://localhost:8000/orders \\
-  -H "Content-Type: application/json" \\
-  -H "Idempotency-Key: &lt;unique-key&gt;" \\
-  -d '{"customer_id":"cust1","item_id":"item1","quantity":1}'</pre>
-
-  <p><span class="method get">GET</span> <code>/orders/{order_id}</code></p>
-  <p>Retrieve an order by its ID.</p>
-  <pre>curl http://localhost:8000/orders/&lt;order_id&gt;</pre>
-
-  <p>Interactive docs: <a href="/docs">/docs</a></p>
+  <h1>Order API</h1>
+  <p>Endpoints: <code>POST /orders</code>, <code>GET /orders/{id}</code>,
+     <code>POST /items</code>, <code>GET /items/{id}</code>,
+     <code>GET /health</code></p>
+  <p>Docs: <a href="/docs">/docs</a></p>
 </body>
 </html>
 """
 
+
+# ── Items CRUD ──────────────────────────────────────────────
+
+@app.post("/items", status_code=201)
+async def create_item(request: Request):
+    data = await request.json()
+    if "name" not in data or "value" not in data:
+        return JSONResponse({"error": "Missing name or value"}, status_code=400)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO items (name, value) VALUES (%s, %s) RETURNING id",
+            (data["name"], data["value"])
+        )
+        item_id = cur.fetchone()[0]
+        conn.commit()
+        return JSONResponse({"id": item_id, "name": data["name"], "value": data["value"]}, status_code=201)
+    except Exception as e:
+        conn.rollback()
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        conn.close()
+
+
+@app.get("/items/{item_id}")
+def get_item(item_id: int):
+    conn = get_db()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM items WHERE id = %s", (item_id,))
+        item = cur.fetchone()
+        if not item:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        return dict(item)
+    finally:
+        conn.close()
+
+
+# ── Orders (idempotent) ────────────────────────────────────
 
 @app.post("/orders", status_code=201)
 async def create_order(request: Request,
@@ -103,16 +126,15 @@ async def create_order(request: Request,
     body_hash = hashlib.sha256(body).hexdigest()
     data = json.loads(body)
 
-    # Basic validation
     for field in ("customer_id", "item_id", "quantity"):
         if field not in data:
             return JSONResponse({"error": f"Missing field: {field}"}, status_code=400)
 
-    db = get_db()
+    conn = get_db()
     try:
-        record = db.execute(
-            "SELECT * FROM idempotency_records WHERE idem_key = ?", (idempotency_key,)
-        ).fetchone()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM idempotency_records WHERE idem_key = %s", (idempotency_key,))
+        record = cur.fetchone()
 
         if record:
             if record["request_hash"] != body_hash:
@@ -121,40 +143,41 @@ async def create_order(request: Request,
             log("INFO", req_id, "replay", idem_key=idempotency_key)
             return JSONResponse(json.loads(record["response_body"]), status_code=record["status_code"])
 
-        # All three writes in a single atomic commit
         order_id = str(uuid.uuid4())
         resp = json.dumps({"order_id": order_id, "status": "created"})
 
-        db.execute("INSERT INTO orders VALUES (?,?,?,?,'created')",
-                   (order_id, data["customer_id"], data["item_id"], data["quantity"]))
-        db.execute("INSERT INTO ledger VALUES (?,?,?,?)",
-                   (str(uuid.uuid4()), order_id, data["customer_id"], 9.99 * data["quantity"]))
-        db.execute("INSERT INTO idempotency_records VALUES (?,?,?,?,?)",
-                   (idempotency_key, body_hash, resp, 201, datetime.now(timezone.utc).isoformat()))
-        db.commit()
+        cur.execute("INSERT INTO orders (order_id, customer_id, item_id, quantity) VALUES (%s,%s,%s,%s)",
+                    (order_id, data["customer_id"], data["item_id"], data["quantity"]))
+        cur.execute("INSERT INTO ledger (ledger_id, order_id, customer_id, amount) VALUES (%s,%s,%s,%s)",
+                    (str(uuid.uuid4()), order_id, data["customer_id"], 9.99 * data["quantity"]))
+        cur.execute("INSERT INTO idempotency_records (idem_key, request_hash, response_body, status_code, created_at) VALUES (%s,%s,%s,%s,%s)",
+                    (idempotency_key, body_hash, resp, 201, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
 
         log("INFO", req_id, "created", order_id=order_id)
 
-        # Simulate failure after commit
         if request.headers.get("X-Debug-Fail-After-Commit") == "true":
             log("WARN", req_id, "simulated_fail", order_id=order_id)
             return JSONResponse({"error": "Simulated failure"}, status_code=500)
 
         return JSONResponse({"order_id": order_id, "status": "created"}, status_code=201)
     except Exception as e:
+        conn.rollback()
         log("ERROR", req_id, "error", detail=str(e))
         return JSONResponse({"error": "Internal server error"}, status_code=500)
     finally:
-        db.close()
+        conn.close()
 
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: str):
-    db = get_db()
+    conn = get_db()
     try:
-        order = db.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+        order = cur.fetchone()
         if not order:
             return JSONResponse({"error": "Not found"}, status_code=404)
         return dict(order)
     finally:
-        db.close()
+        conn.close()
