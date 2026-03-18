@@ -16,6 +16,9 @@ __pycache__/
 # CloudFormation
 cloudformation.yml
 
+#Demo script
+demo-script.md
+
 # IDE
 .vscode/
 .idea/

@@ -137,15 +137,17 @@ k6 run loadtest.js
 |--------|-------|
 | VUs | 10 |
 | Duration | 30s |
-| RPS | ~TBD |
-| p50 latency | ~TBD |
-| p95 latency | ~TBD |
-| p99 latency | ~TBD |
-| Failed requests | ~TBD |
+| Total requests | 7620 |
+| RPS | ~253 req/s |
+| p50 latency | 4.75ms |
+| p90 latency | 10.65ms |
+| p95 latency | 13.3ms |
+| Max latency | 51.9ms |
+| Failed requests | 0 (0.00%) |
 
 ### Analysis
 
-`<to be filled after running load test>`
+All 7620 requests passed with 0% failure rate. The API handled ~253 requests/second across 10 concurrent VUs. Median latency was 4.75ms with p95 at 13.3ms. The primary bottleneck is the Postgres connection overhead (new connection per request). For higher throughput, connection pooling (e.g., pgbouncer) would help.
 
 ## Endpoints
 
