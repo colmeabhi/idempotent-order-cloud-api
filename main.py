@@ -9,8 +9,33 @@ import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from limits import parse
+from limits.storage import MemoryStorage
+from limits.strategies import SlidingWindowCounterRateLimiter
+from starlette.middleware.base import BaseHTTPMiddleware
 
 app = FastAPI()
+
+# ── Rate Limiting (10 requests per minute per IP) ─────────────
+limiter = SlidingWindowCounterRateLimiter(MemoryStorage())
+RATE_LIMIT = parse("10/minute")
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            client_ip = forwarded.split(",")[-1].strip()
+        else:
+            client_ip = request.client.host if request.client else "unknown"
+
+        if not limiter.hit(RATE_LIMIT, client_ip):
+            return JSONResponse({"error": "Rate limit exceeded"}, status_code=429)
+
+        return await call_next(request)
+
+
+app.add_middleware(RateLimitMiddleware)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
