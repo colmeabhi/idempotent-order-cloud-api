@@ -123,6 +123,55 @@ RDS Postgres (`db.t3.micro`, single-AZ)
 - ECS: Fargate 0.25 vCPU / 0.5 GB
 - RDS: db.t3.micro
 
+## Rate Limiting
+
+The API includes a sliding window counter rate limiter using the `limits` library. It limits requests to **10 per minute per client IP**.
+
+### How It Works
+
+- Implemented as FastAPI middleware — intercepts every request before it reaches a route handler.
+- Uses the `SlidingWindowCounterRateLimiter` strategy with in-memory storage.
+- Behind an ALB, the real client IP is extracted from the `X-Forwarded-For` header (last entry, appended by ALB).
+- Requests exceeding the limit receive a `429 Too Many Requests` response.
+
+### Test Rate Limiting
+
+Send 12 rapid requests — the first 10 succeed, the last 2 are rejected:
+
+```bash
+for i in $(seq 1 12); do
+  echo "--- request $i ---"
+  curl -s -w "\nHTTP Status: %{http_code}\n" http://localhost:8080/health
+  echo ""
+done
+```
+
+Expected output:
+
+```
+--- request 1 ---
+{"status":"ok","db":"connected"}
+HTTP Status: 200
+...
+--- request 11 ---
+{"error":"Rate limit exceeded"}
+HTTP Status: 429
+
+--- request 12 ---
+{"error":"Rate limit exceeded"}
+HTTP Status: 429
+```
+
+### Configuration
+
+The rate limit is set in `main.py`:
+
+```python
+RATE_LIMIT = parse("10/minute")
+```
+
+Change the string to adjust (e.g., `"100/hour"`, `"5/second"`).
+
 ## Load Test
 
 ### Run
