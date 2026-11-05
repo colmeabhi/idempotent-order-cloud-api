@@ -149,7 +149,12 @@ async def create_order(request: Request,
 
     body = await request.body()
     body_hash = hashlib.sha256(body).hexdigest()
-    data = json.loads(body)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return JSONResponse({"error": "Body must be valid JSON"}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
 
     for field in ("customer_id", "item_id", "quantity"):
         if field not in data:
@@ -158,25 +163,35 @@ async def create_order(request: Request,
     conn = get_db()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM idempotency_records WHERE idem_key = %s", (idempotency_key,))
-        record = cur.fetchone()
 
-        if record:
+        order_id = str(uuid.uuid4())
+        resp = json.dumps({"order_id": order_id, "status": "created"})
+
+        # Claim the key before doing any work. If another transaction holds the
+        # same key, this INSERT blocks on the unique index until that transaction
+        # finishes; then it either conflicts (other one committed -> replay) or
+        # succeeds (other one rolled back -> we own the key). No SELECT-then-INSERT
+        # window, so two parallel requests can't both get past the check.
+        cur.execute(
+            "INSERT INTO idempotency_records (idem_key, request_hash, response_body, status_code, created_at) "
+            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (idem_key) DO NOTHING RETURNING idem_key",
+            (idempotency_key, body_hash, resp, 201, datetime.now(timezone.utc).isoformat()))
+
+        if cur.fetchone() is None:
+            # Key already committed by an earlier (or concurrent) request.
+            conn.rollback()
+            cur.execute("SELECT * FROM idempotency_records WHERE idem_key = %s", (idempotency_key,))
+            record = cur.fetchone()
             if record["request_hash"] != body_hash:
                 log("WARN", req_id, "conflict", idem_key=idempotency_key)
                 return JSONResponse({"error": "Same key, different payload"}, status_code=409)
             log("INFO", req_id, "replay", idem_key=idempotency_key)
             return JSONResponse(json.loads(record["response_body"]), status_code=record["status_code"])
 
-        order_id = str(uuid.uuid4())
-        resp = json.dumps({"order_id": order_id, "status": "created"})
-
         cur.execute("INSERT INTO orders (order_id, customer_id, item_id, quantity) VALUES (%s,%s,%s,%s)",
                     (order_id, data["customer_id"], data["item_id"], data["quantity"]))
         cur.execute("INSERT INTO ledger (ledger_id, order_id, customer_id, amount) VALUES (%s,%s,%s,%s)",
                     (str(uuid.uuid4()), order_id, data["customer_id"], 9.99 * data["quantity"]))
-        cur.execute("INSERT INTO idempotency_records (idem_key, request_hash, response_body, status_code, created_at) VALUES (%s,%s,%s,%s,%s)",
-                    (idempotency_key, body_hash, resp, 201, datetime.now(timezone.utc).isoformat()))
         conn.commit()
 
         log("INFO", req_id, "created", order_id=order_id)
