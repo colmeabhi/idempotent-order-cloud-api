@@ -1,6 +1,8 @@
+import asyncio
 import hashlib
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -10,6 +12,7 @@ from fastapi import FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+import cleanup
 from db import Database, PoolTimeout
 from ratelimit import RateLimitMiddleware
 
@@ -20,9 +23,26 @@ logger = logging.getLogger("orders")
 db = Database()
 
 
+IDEMPOTENCY_TTL = cleanup.ttl_seconds()
+CLEANUP_INTERVAL = int(os.getenv("IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS", "3600"))
+
+
+async def cleanup_loop():
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        try:
+            await run_in_threadpool(cleanup.run_once, db)
+        except Exception as exc:  # keep the loop alive; try again next interval
+            logger.warning(json.dumps({"level": "WARN", "msg": "idempotency_cleanup_failed",
+                                       "detail": str(exc)}))
+
+
 @asynccontextmanager
 async def lifespan(app):
+    task = asyncio.create_task(cleanup_loop()) if CLEANUP_INTERVAL > 0 else None
     yield
+    if task:
+        task.cancel()
     db.close()
 
 
@@ -130,13 +150,21 @@ def _create_order_tx(idempotency_key, body_hash, data):
         # finishes; then it either conflicts (other one committed -> replay) or
         # succeeds (other one rolled back -> we own the key). No SELECT-then-INSERT
         # window, so two parallel requests can't both get past the check.
+        #
+        # A key older than the TTL counts as unused: the DO UPDATE ... WHERE takes
+        # it over, so expiry is exact even if the cleanup job hasn't run yet.
         cur.execute(
             "INSERT INTO idempotency_records (idem_key, request_hash, response_body, status_code, created_at) "
-            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (idem_key) DO NOTHING RETURNING idem_key",
-            (idempotency_key, body_hash, json.dumps(resp), 201, datetime.now(timezone.utc).isoformat()))
+            "VALUES (%s,%s,%s,%s,now()) "
+            "ON CONFLICT (idem_key) DO UPDATE SET request_hash = EXCLUDED.request_hash, "
+            "  response_body = EXCLUDED.response_body, status_code = EXCLUDED.status_code, "
+            "  created_at = EXCLUDED.created_at "
+            "WHERE idempotency_records.created_at < now() - make_interval(secs => %s) "
+            "RETURNING idem_key",
+            (idempotency_key, body_hash, json.dumps(resp), 201, IDEMPOTENCY_TTL))
 
         if cur.fetchone() is None:
-            # Key already committed by an earlier (or concurrent) request.
+            # Live key already committed by an earlier (or concurrent) request.
             conn.rollback()
             cur.execute("SELECT * FROM idempotency_records WHERE idem_key = %s", (idempotency_key,))
             record = cur.fetchone()
