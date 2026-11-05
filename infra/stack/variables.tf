@@ -49,3 +49,44 @@ variable "certificate_arn" {
   type        = string
   default     = ""
 }
+
+variable "image_tag" {
+  description = "Image tag in the ECR repo to deploy (CI passes the git SHA)."
+  type        = string
+}
+
+variable "desired_count" {
+  type    = number
+  default = 2
+}
+
+variable "task_cpu" {
+  type    = number
+  default = 256
+}
+
+variable "task_memory" {
+  type    = number
+  default = 512
+}
+
+variable "db_pool_max" {
+  description = "Connections per task. Keep desired_count x 2 (deploy overlap) x this under RDS max_connections (~80 on db.t3.micro)."
+  type        = number
+  default     = 10
+}
+
+variable "rate_limit" {
+  type    = string
+  default = "10/minute"
+}
+
+variable "idempotency_ttl_hours" {
+  type    = number
+  default = 24
+}
+
+variable "log_retention_days" {
+  type    = number
+  default = 30
+}
