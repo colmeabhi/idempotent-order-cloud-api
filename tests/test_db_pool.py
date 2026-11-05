@@ -37,13 +37,72 @@ def test_uncommitted_work_is_rolled_back_on_return(pool, db):
         assert cur.fetchone()[0] == 0
 
 
-def test_dead_connection_is_discarded(pool, db):
-    pid = backend_pid(pool)
-    with db.cursor() as cur:  # simulate RDS restart / failover killing the session
-        cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+def terminate(db, pids):
+    """Kill sessions the way an RDS restart / failover would."""
+    with db.cursor() as cur:
+        for pid in pids:
+            cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+    time.sleep(0.05)  # termination is asynchronous
+
+
+def test_dead_connection_is_discarded(db):
+    # Used moments ago, so the liveness check is skipped: the query itself fails,
+    # and the connection must still not be handed out again.
+    d = Database(minconn=1, maxconn=2, timeout=0.5, ping_after=3600)
+    pid = backend_pid(d)
+    terminate(db, [pid])
     with pytest.raises(psycopg2.OperationalError):
-        backend_pid(pool)
-    assert backend_pid(pool) != pid  # next borrower gets a fresh, working connection
+        backend_pid(d)
+    assert backend_pid(d) != pid  # next borrower gets a fresh, working connection
+    d.close()
+
+
+def test_idle_dead_connections_are_replaced_before_use(db):
+    """Regression: after a Postgres restart every idle connection used to cost
+    one client a 500, up to DB_POOL_MAX of them per process."""
+    d = Database(minconn=3, maxconn=3, timeout=1, ping_after=0)
+    barrier = threading.Barrier(3)
+    pids = set()
+
+    def borrow():
+        with d.connection() as conn, conn.cursor() as cur:
+            barrier.wait()  # hold all 3 at once so each backend is distinct
+            cur.execute("SELECT pg_backend_pid()")
+            pids.add(cur.fetchone()[0])
+
+    threads = [threading.Thread(target=borrow) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(pids) == 3
+
+    terminate(db, pids)
+    # None of these may raise, even though every pooled connection is dead.
+    assert {backend_pid(d) for _ in range(5)}.isdisjoint(pids)
+    d.close()
+
+
+def test_api_survives_postgres_restart(client, db, monkeypatch):
+    import main
+    assert client.post("/items", json={"name": "a", "value": 1}).status_code == 201
+    monkeypatch.setattr(main.db, "ping_after", 0)
+    with db.cursor() as cur:
+        cur.execute("SELECT pid FROM pg_stat_activity WHERE application_name = 'order-api'")
+        pids = [row[0] for row in cur.fetchall()]
+    assert pids
+    terminate(db, pids)
+    assert client.get("/items/1").status_code == 200
+
+
+def test_unreachable_database_still_raises(db):
+    d = Database(minconn=1, maxconn=1, timeout=0.5, ping_after=0)
+    pid = backend_pid(d)
+    terminate(db, [pid])
+    d._pool._kwargs.update(host="127.0.0.1", port="1", connect_timeout=1)  # can't reconnect
+    for _ in range(2):  # maxconn=1: a leaked slot would turn the 2nd try into PoolTimeout
+        with pytest.raises(psycopg2.OperationalError):
+            backend_pid(d)
 
 
 def test_exhausted_pool_waits_then_times_out(pool):

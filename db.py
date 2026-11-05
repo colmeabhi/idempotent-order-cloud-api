@@ -9,11 +9,19 @@ callers queue for up to ``DB_POOL_TIMEOUT`` seconds and only then fail.
 
 Setting ``DB_POOL_MAX=0`` disables pooling (one connection per request).
 That mode exists so the load test can measure before/after on the same code.
+
+A pooled connection can die while idle (Postgres restart, RDS failover), which
+the client only notices when it next uses it. So a connection idle for more
+than ``DB_POOL_PING_AFTER`` seconds is checked before being handed out, and
+replaced if dead. The check runs before any application SQL, so replacing the
+connection can never repeat a write. Busy connections skip it to avoid the
+extra round trips.
 """
 
 import contextlib
 import os
 import threading
+import time
 
 import psycopg2
 import psycopg2.pool
@@ -36,7 +44,7 @@ def _dsn_kwargs():
 
 
 class Database:
-    def __init__(self, minconn=None, maxconn=None, timeout=None):
+    def __init__(self, minconn=None, maxconn=None, timeout=None, ping_after=None):
         self.maxconn = int(os.getenv("DB_POOL_MAX", "10")) if maxconn is None else maxconn
         # psycopg2 keeps at most `minconn` idle connections and *closes* any
         # other connection when it is returned. With a low minconn, a burst of
@@ -45,6 +53,8 @@ class Database:
         # the whole pool is kept warm: minconn == maxconn.
         self.minconn = int(os.getenv("DB_POOL_MIN", str(self.maxconn))) if minconn is None else minconn
         self.timeout = float(os.getenv("DB_POOL_TIMEOUT", "5")) if timeout is None else timeout
+        self.ping_after = float(os.getenv("DB_POOL_PING_AFTER", "1")) if ping_after is None else ping_after
+        self._last_used = {}  # id(conn) -> time.monotonic() when last returned
         self._pool = None
         self._slots = None
         self._lock = threading.Lock()
@@ -64,6 +74,36 @@ class Database:
                     self._slots = threading.BoundedSemaphore(self.maxconn)
         return self._pool
 
+    def _discard(self, pool, conn):
+        self._last_used.pop(id(conn), None)
+        pool.putconn(conn, close=True)
+
+    def _is_alive(self, conn):
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()
+            return True
+        except psycopg2.Error:
+            return False
+
+    def _checkout(self, pool):
+        """Get a usable connection, replacing any that died while idle.
+
+        Only a recently returned connection skips the check. One with no
+        _last_used entry may have been opened long ago to fill the pool's
+        minconn, so it is checked too. The loop ends because the pool holds at
+        most maxconn dead connections; if Postgres is really down, opening a
+        new connection raises.
+        """
+        while True:
+            conn = pool.getconn()
+            last_used = self._last_used.get(id(conn))
+            recently_used = last_used is not None and time.monotonic() - last_used < self.ping_after
+            if not conn.closed and (recently_used or self._is_alive(conn)):
+                return conn
+            self._discard(pool, conn)
+
     @contextlib.contextmanager
     def connection(self):
         """Yield a connection. Rolls back on error; never leaks a slot."""
@@ -81,7 +121,7 @@ class Database:
         conn = None
         broken = False
         try:
-            conn = pool.getconn()
+            conn = self._checkout(pool)
             yield conn
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
             # Connection died (e.g. RDS failover/restart): don't hand it out again.
@@ -94,7 +134,11 @@ class Database:
                         conn.rollback()  # leave nothing open for the next borrower
                     except psycopg2.Error:
                         broken = True
-                pool.putconn(conn, close=broken or bool(conn.closed))
+                if broken or conn.closed:
+                    self._discard(pool, conn)
+                else:
+                    self._last_used[id(conn)] = time.monotonic()
+                    pool.putconn(conn)
             self._slots.release()
 
     def close(self):
@@ -103,3 +147,4 @@ class Database:
                 self._pool.closeall()
                 self._pool = None
                 self._slots = None
+                self._last_used.clear()
