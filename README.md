@@ -174,8 +174,11 @@ default 10) instead of opening one per request. Details that matter:
   `minconn=1`, a burst of traffic reconnected on nearly every request while
   holding the pool's global lock, which was *slower* than no pool (≈90 vs
   ≈180 req/s). `DB_POOL_MIN` therefore defaults to `DB_POOL_MAX`.
-- Connections that die (RDS reboot or failover) are discarded instead of being
-  handed out again.
+- Connections that die (Postgres restart, RDS failover) are discarded instead
+  of being handed out again. A connection idle for more than
+  `DB_POOL_PING_AFTER` seconds is checked before use and replaced if dead, so a
+  restart doesn't cost a client a `500` for each pooled connection. The check
+  runs before any application SQL, so it can't repeat a write.
 - Blocking DB calls run in the threadpool. Previously the `async` handlers
   called psycopg2 directly and blocked the event loop.
 
@@ -214,38 +217,52 @@ k6 run -e BASE_URL=http://<alb-dns> loadtest/orders.js
 
 ### Results: `/orders`, before vs after pooling
 
-One uvicorn worker (like one Fargate task) with local Postgres 16, limiter off,
-30 s per run, 0% errors and 100% checks passed in every run.
+Measured on an Apple M4 (10 cores, 16 GB) with k6 2.3 and the API, Postgres 16
+and k6 all running natively on the same machine. One uvicorn worker (like one
+Fargate task), limiter off, 30 s per run. Each figure is the median of 3 runs,
+with 0% errors and 100% checks passed in every run. "Before" is commit
+`9e24a6b`, the last one without pooling, measured on the same machine.
 
 **10 VUs, 0.1 s think time** (same shape as the original test)
 
 | | Before | Threadpool only | Threadpool + pool |
 |---|---|---|---|
-| RPS | 63 | 146 | **242** |
-| p50 | 145 ms | 32 ms | **6.3 ms** |
-| p95 | 198 ms | 56 ms | **15.5 ms** |
-| p99 | 226 ms | 69 ms | **21.4 ms** |
+| RPS | 146 | 231 | **246** |
+| p50 | 36.6 ms | 8.3 ms | **7.0 ms** |
+| p95 | 62.8 ms | 16.8 ms | **12.5 ms** |
+| p99 | 86.4 ms | 23.9 ms | **22.0 ms** |
 
 **50 VUs, no think time** (saturation)
 
 | | Before | Threadpool only | Threadpool + pool |
 |---|---|---|---|
-| RPS | 76 | 182 | **570** |
-| p50 | 698 ms | 272 ms | **88 ms** |
-| p95 | 855 ms | 393 ms | **123 ms** |
-| p99 | 1054 ms | 453 ms | **149 ms** |
+| RPS | 303 | 544 | **3,558** |
+| p50 | 160.8 ms | 88.9 ms | **13.4 ms** |
+| p95 | 191.4 ms | 148.5 ms | **22.4 ms** |
+| p99 | 259.7 ms | 184.3 ms | **32.7 ms** |
 
-- **Before:** a new connection per request (about 13 ms of TCP + SCRAM auth),
-  and the async handler blocked the event loop, so requests ran one at a time.
+- **Before:** a new connection per request, and the async handler blocked the
+  event loop, so requests ran one at a time.
 - **Threadpool only** (`DB_POOL_MAX=0`): requests overlap but still pay for
   the connect each time.
-- **Threadpool + pool:** 3.8× the RPS and 13× lower p95 at the original
-  profile; 7.5× the RPS and 7× lower p95 at saturation. In the light profile,
-  10 VUs with 0.1 s sleep cap throughput at about 260 RPS, so 242 is close
-  to that ceiling.
+- **Threadpool + pool:** 1.7× the RPS and 5× lower p95 at the original
+  profile; 11.7× the RPS and 8.6× lower p95 at saturation. The light profile
+  says little about throughput: 10 VUs with 0.1 s sleep cap it at about 260 RPS,
+  so 246 is close to that ceiling. Its latency figures are the useful part.
 
-Against RDS the gap should be larger, because each new connection there also
-pays for TLS and a network round trip.
+**Read these as a comparison, not as production capacity:**
+
+- macOS Postgres uses `wal_sync_method=open_datasync`, which doesn't force a
+  full flush to the drive, so commits are much cheaper than on a Linux server.
+  An earlier run of this test on a different host peaked at 570 RPS.
+- There is no network between the API and the database. Against RDS each query
+  adds a round trip, and each new connection also pays for TLS, so the absolute
+  numbers will be lower.
+- k6 shares the CPU with the API and Postgres.
+
+The liveness check on idle connections costs nothing measurable here: 3,558 RPS
+with it and 3,599 without. It only runs on connections idle for over 1 s, which
+never happens at saturation.
 
 The earlier results (`/health` + `/items`, connection per request, before
 the rate limiter was added) were 253 RPS with p95 13.3 ms, on a different
@@ -277,8 +294,11 @@ python -m pytest -v
 | `tests/test_concurrency.py` | **50 parallel requests with one key → 50 × 201, same `order_id`, exactly 1 order and 1 ledger row**, against an 8-worker uvicorn. Also a deterministic version that holds the key in an open transaction. The old code fails all three. |
 | `tests/test_orders.py` | Create, replay, 409 on a different payload, validation, retry after a failure after commit |
 | `tests/test_ttl.py` | Expired key taken over, live key still 409, batched purge, advisory-lock skip, TEXT→TIMESTAMPTZ migration |
-| `tests/test_db_pool.py` | Reuse, rollback on return, dead-connection eviction, wait-then-timeout, no reconnects under bursts |
+| `tests/test_db_pool.py` | Reuse, rollback on return, dead-connection eviction, **API keeps working after every pooled connection dies**, wait-then-timeout, no reconnects under bursts |
 | `tests/test_rate_limit.py` | Limit, `Retry-After`, `/health` exempt, `X-Forwarded-For`, memory = per instance, **Redis = shared across instances**, fail-open |
+
+All 41 tests pass, both against the Compose Postgres and Redis and against
+native Postgres 16 and Redis.
 
 **CI** (`.github/workflows/ci.yml`) runs on every PR and every branch push. It
 runs pytest against Postgres 16 and Redis 7 service containers, builds the
@@ -292,6 +312,7 @@ Docker image, and runs `terraform fmt`/`validate`.
 | `DB_POOL_MAX` | `10` | Connections per process; `0` = no pooling |
 | `DB_POOL_MIN` | `= DB_POOL_MAX` | See Connection Pooling |
 | `DB_POOL_TIMEOUT` | `5` | Seconds to wait for a free connection before returning 503 |
+| `DB_POOL_PING_AFTER` | `1` | Check a connection before use if it has been idle this many seconds |
 | `RATE_LIMIT` | `10/minute` | Any [limits](https://limits.readthedocs.io) string, e.g. `100/hour` |
 | `RATE_LIMIT_STORAGE_URI` | `memory://` | `redis://host:6379/0` to share limits across tasks |
 | `RATE_LIMIT_ENABLED` | `true` | |
