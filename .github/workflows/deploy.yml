@@ -1,0 +1,97 @@
+name: Deploy
+
+# main -> tests -> build & push image -> terraform apply -> smoke test.
+#
+# One-time setup (see README "Deploying with Terraform"):
+#   1. Apply infra/bootstrap with admin credentials.
+#   2. Create a GitHub environment named "production" (Settings -> Environments);
+#      the OIDC role only trusts that environment. Add required reviewers there
+#      if deploys should wait for approval.
+#   3. Add repository variables (Settings -> Secrets and variables -> Variables)
+#      from the bootstrap outputs: AWS_REGION, AWS_DEPLOY_ROLE_ARN,
+#      TF_STATE_BUCKET, TF_LOCK_TABLE, ECR_REPOSITORY.
+# No AWS secrets are stored in GitHub: the job assumes the role through OIDC.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false # never interrupt a terraform apply
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # OIDC token for AWS
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          # Tags are immutable: on a re-run for the same commit, reuse the image.
+          if aws ecr describe-images --repository-name "${{ vars.ECR_REPOSITORY }}" \
+               --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Image $IMAGE already exists"
+          else
+            docker build -t "$IMAGE" .
+            docker push "$IMAGE"
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: infra/stack
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=order-api/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform apply
+        working-directory: infra/stack
+        run: |
+          terraform apply -input=false -auto-approve \
+            -var="region=${AWS_REGION}" \
+            -var="image_tag=${IMAGE_TAG}"
+
+      - name: Smoke test
+        working-directory: infra/stack
+        run: |
+          URL="$(terraform output -raw alb_url)"
+          echo "Deployed to $URL" >> "$GITHUB_STEP_SUMMARY"
+          for i in $(seq 1 20); do
+            if curl -fsS "$URL/health"; then exit 0; fi
+            sleep 6
+          done
+          echo "::error::$URL/health did not return 200"
+          exit 1

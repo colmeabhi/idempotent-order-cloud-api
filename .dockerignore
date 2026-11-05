@@ -1,0 +1,13 @@
+.git
+.github
+.terraform
+infra
+tests
+loadtest
+**/__pycache__
+.pytest_cache
+.env
+*.md
+curlcommands.txt
+requirements-dev.txt
+pytest.ini

@@ -22,3 +22,13 @@ demo-script.md
 # IDE
 .vscode/
 .idea/
+
+# Tests
+.pytest_cache/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl.bak
