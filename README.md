@@ -99,14 +99,14 @@ sequenceDiagram
     participant A as Request A
     participant B as Request B (same key)
     participant DB as Postgres
-    A->>DB: BEGIN; INSERT key ON CONFLICT ... RETURNING
+    A->>DB: BEGIN, then INSERT key ON CONFLICT ... RETURNING
     DB-->>A: 1 row (A owns the key)
-    B->>DB: BEGIN; INSERT key ON CONFLICT ... RETURNING
+    B->>DB: BEGIN, then INSERT key ON CONFLICT ... RETURNING
     Note over B,DB: blocks on the unique index<br/>until A's transaction ends
     A->>DB: INSERT order, INSERT ledger, COMMIT
     DB-->>B: 0 rows (conflict with committed key)
     B->>DB: SELECT stored response
-    DB-->>B: {order_id: A's order}
+    DB-->>B: stored response (A's order_id)
     Note over A,B: both return 201 with the same order_id
 ```
 
