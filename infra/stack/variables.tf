@@ -17,3 +17,24 @@ variable "az_count" {
   type    = number
   default = 2
 }
+
+variable "db_instance_class" {
+  type    = string
+  default = "db.t3.micro"
+}
+
+variable "db_allocated_storage" {
+  type    = number
+  default = 20
+}
+
+variable "db_multi_az" {
+  type    = bool
+  default = false
+}
+
+variable "db_deletion_protection" {
+  description = "Set false (and apply) before terraform destroy."
+  type        = bool
+  default     = true
+}
