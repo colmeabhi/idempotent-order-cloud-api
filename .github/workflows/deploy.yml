@@ -30,6 +30,8 @@ jobs:
 
   deploy:
     needs: test
+    # Skipped until the one-time setup above has been done.
+    if: vars.AWS_DEPLOY_ROLE_ARN != ''
     runs-on: ubuntu-latest
     environment: production
     permissions:

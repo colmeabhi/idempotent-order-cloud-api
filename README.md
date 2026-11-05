@@ -377,7 +377,10 @@ private subnets and add a NAT gateway or VPC endpoints.
 
 ### Deploying
 
-Push to `main`, or run the **Deploy** workflow by hand. `.github/workflows/deploy.yml`:
+Push to `main`, or run the **Deploy** workflow by hand. Until
+`AWS_DEPLOY_ROLE_ARN` is set, only the tests run and the deploy job is skipped.
+Setting the variables turns on real deploys: the next push to `main` runs
+`terraform apply`, which creates billable resources. `.github/workflows/deploy.yml`:
 
 1. runs the full CI suite;
 2. builds the image and pushes `order-api:<git sha>` to ECR;
