@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches-ignore: [main] # main runs this via deploy.yml
   pull_request:
   workflow_call:
 
@@ -48,3 +48,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t order-api:ci .
+
+  terraform:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dir: [infra/bootstrap, infra/stack]
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - run: terraform fmt -check -diff
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
