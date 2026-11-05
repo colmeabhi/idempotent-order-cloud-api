@@ -43,3 +43,9 @@ variable "redis_node_type" {
   type    = string
   default = "cache.t4g.micro"
 }
+
+variable "certificate_arn" {
+  description = "ACM certificate for HTTPS. Empty = HTTP only on port 80."
+  type        = string
+  default     = ""
+}
