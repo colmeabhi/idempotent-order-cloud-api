@@ -25,3 +25,10 @@ demo-script.md
 
 # Tests
 .pytest_cache/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl.bak
